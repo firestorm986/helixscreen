@@ -1,0 +1,75 @@
+name: Build K1 MIPS Binary
+
+on:
+  push:
+    branches:
+      - 'feature/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-mips:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Initialize submodules
+        uses: ./.github/actions/init-submodules
+
+      - name: Free up disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Add swap for the link peak
+        run: |
+          free -h
+          sudo fallocate -l 16G /swapfile-helix || sudo dd if=/dev/zero of=/swapfile-helix bs=1M count=16384
+          sudo chmod 600 /swapfile-helix
+          sudo mkswap /swapfile-helix
+          sudo swapon /swapfile-helix
+          free -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build MIPS toolchain image
+        run: |
+          docker buildx build \
+            --cache-from type=gha,scope=toolchain-mips \
+            --cache-to type=gha,mode=max,scope=toolchain-mips \
+            --load \
+            -t helixscreen/toolchain-mips \
+            -f docker/Dockerfile.mips \
+            docker/
+
+      - name: Cross-compile for MIPS
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/src \
+            -w /src \
+            helixscreen/toolchain-mips \
+            make PLATFORM_TARGET=mips HELIX_PACKAGING=1 SKIP_OPTIONAL_DEPS=1 -j$(nproc)
+
+      - name: Fix build directory ownership
+        run: sudo chown -R $(id -u):$(id -g) build/
+
+      - name: Verify binary exists
+        run: |
+          ls -la build/mips/bin/
+          file build/mips/bin/helix-screen
+
+      - name: Upload helix-screen binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: helix-screen-k1-mips
+          path: build/mips/bin/helix-screen
