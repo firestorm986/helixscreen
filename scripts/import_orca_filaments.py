@@ -18,6 +18,43 @@ TYPE_MAP = {
     "PET-CF": "PET-CF", "PET-GF": "PET-GF", "ABS": "ABS", "ABS-CF": "ABS-CF",
     "ASA": "ASA", "PC": "PC", "PA": "PA", "PA-CF": "PA-CF", "PA6": "PA6",
     "TPU": "TPU", "PVA": "PVA", "HIPS": "HIPS", "PPS-CF": "PPS-CF",
+    # Vendor-specific aliases from manufacturer packs:
+    "FLEX": "TPU",
+    "PEBA": "TPU",
+    "TPU for ACE": "TPU",
+    "TPU-64D": "TPU",
+    "TPU-90A": "TPU",
+    "TPU-AERO": "TPU",
+    "TPU-GF": "TPU",
+    "SILK": "Silk PLA",
+    "PLA Silk": "Silk PLA",
+    "PLA Matte": "Matte PLA",
+    "PLA Basic": "PLA",
+    "PLA Basic+": "PLA+",
+    "PLA Tough": "PLA+",
+    "PETG Basic": "PETG",
+    "PETG Polymax": "PETG",
+    "PETG-CF10": "PETG-CF",
+    "PETG-ESD": "PETG",
+    "PAHT": "PA",
+    "PAHT-CF": "PA-CF",
+    "PAHT-GF": "PA-GF",
+    "PAHT-S": "PA",
+    "PA-S": "PA",
+    "PA12-CF": "PA-CF",
+    "PACF Pro": "PA-CF",
+    "UltraPA": "PA",
+    "UltraPA-CF25": "PA-CF",
+    "PC-ABS-FR": "PC-ABS",
+    "PPS-GF": "PPS",
+    "PE-CF": "PE",
+    "PVB": "PLA",
+    "ABS Material4Print Natur": "ABS",
+    "HPP4GF25": "PP-GF",
+    "VXL90 Xioneer": "PVA",
+    "S-Multi": "PVA",
+    "S-PAHT": "PA",
+    "UNIV": "PLA",
 }
 
 BED_PRIORITY = ("textured_plate_temp", "hot_plate_temp", "cool_plate_temp")
@@ -187,37 +224,79 @@ def _display_name(profile_name: str, brand: str) -> str:
     return name or profile_name
 
 
-def build_catalog(orca_root, cfs_seed, type_ranges, library_marker="OrcaFilamentLibrary"):
+def build_catalog(orca_root, cfs_seed, type_ranges, library_marker="OrcaFilamentLibrary", all_vendors=True):
     # The OrcaFilamentLibrary is self-contained (its own base/ dir). Resolve
-    # inheritance ONLY within it: loading the ~30 other vendor packs clobbers
-    # same-named bases (e.g. fdm_filament_pc) in the flat name->profile map and
-    # corrupts inherited vendor + temperature values. See the collision test.
+    # inheritance ONLY within it for library products: loading the other vendor
+    # packs into a flat map clobbers same-named bases (e.g. fdm_filament_pc)
+    # and corrupts inherited vendor + temperature values (see the collision test).
     lib_root = os.path.join(orca_root, "OrcaFilamentLibrary", "filament")
-    load_root = lib_root if os.path.isdir(lib_root) else orca_root
+    if not os.path.isdir(lib_root):
+        lib_root = os.path.join(orca_root, "OrcaFilamentLibrary")
+    is_multi_vendor = os.path.isdir(lib_root)
+    load_root = lib_root if is_multi_vendor else orca_root
     by_name = load_profiles(load_root)
     products = []
     seen = set()
     library_types = set()
-    for pname, profile in by_name.items():
+
+    def _process_profile(pname, profile, resolver):
         if profile.get("instantiation") != "true":
-            continue  # templates, not user-facing products
-        if library_marker and library_marker not in profile.get("_src", ""):
-            continue  # skip printer-specific profiles outside the library
-        resolved = resolve_inherits(profile, by_name)
+            return
+        resolved = resolver(profile)
         brand = first_scalar(resolved.get("filament_vendor")) or "Generic"
         resolved["_product_name"] = _display_name(pname, brand)
         orca_type = first_scalar(resolved.get("filament_type")) or ""
-        # RAW type — this is the vocabulary Orca matches on. Must NOT be
-        # map_type()'d: our catalog deliberately carries finer types than Orca.
         if orca_type:
             library_types.add(orca_type)
         base_range = type_ranges.get(map_type(orca_type))
         product = build_product(resolved, base_range)
         key = (product["brand"], product["name"])
         if key in seen:
-            continue  # collapse per-color duplicates
+            return
         seen.add(key)
         products.append(product)
+
+    for pname, profile in by_name.items():
+        if library_marker and library_marker not in profile.get("_src", ""):
+            continue
+        _process_profile(pname, profile, lambda prof: resolve_inherits(prof, by_name))
+
+    # If multi-vendor tree present and all_vendors requested, load each vendor pack
+    # resolving inheritance scoped to that vendor first, falling back to OrcaFilamentLibrary bases.
+    if is_multi_vendor and all_vendors and library_marker != "OrcaFilamentLibrary-only":
+        for v in sorted(os.listdir(orca_root)):
+            if v == "OrcaFilamentLibrary" or v.startswith("."):
+                continue
+            v_dir = os.path.join(orca_root, v, "filament")
+            if not os.path.isdir(v_dir):
+                v_dir = os.path.join(orca_root, v)
+                if not os.path.isdir(v_dir):
+                    continue
+            v_profiles = load_profiles(v_dir)
+
+            def resolve_vendor(prof, depth=0):
+                if depth > 20:
+                    return {}
+                parent = prof.get("inherits")
+                if parent:
+                    if parent in v_profiles:
+                        merged = resolve_vendor(v_profiles[parent], depth + 1)
+                    elif parent in by_name:
+                        merged = resolve_inherits(by_name[parent], by_name)
+                    else:
+                        merged = {}
+                else:
+                    merged = {}
+                merged = dict(merged)
+                for k, val in prof.items():
+                    if k in ("inherits", "name", "instantiation"):
+                        continue
+                    merged[k] = val
+                return merged
+
+            for pname, profile in v_profiles.items():
+                _process_profile(pname, profile, resolve_vendor)
+
     _merge_cfs_seed(products, cfs_seed)
     _dedupe_ids(products)
     _assert_no_degenerate_ranges(products)
